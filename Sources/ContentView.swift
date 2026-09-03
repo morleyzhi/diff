@@ -79,11 +79,15 @@ struct ContentView: View {
             .help("Clear both sides")
         }
         ToolbarItem(placement: .primaryAction) {
-            Toggle(isOn: $model.ignoreWhitespace) {
+            HStack(spacing: 6) {
                 Text("Ignore whitespace")
+                    .font(.system(size: 12))
+                Toggle("Ignore whitespace", isOn: $model.ignoreWhitespace)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .labelsHidden()
+                    .accessibilityLabel("Ignore whitespace")
             }
-            .toggleStyle(.switch)
-            .controlSize(.small)
             .help("Treat whitespace-only changes as equal")
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
