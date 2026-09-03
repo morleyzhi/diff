@@ -67,8 +67,9 @@ enum DiffEngine {
     }
 
     static func diff(left: String, right: String, ignoreWhitespace: Bool) -> DiffResult {
-        let leftLines = splitLines(left).map(expandTabs)
-        let rightLines = splitLines(right).map(expandTabs)
+        // Keep original line text so editor highlight ranges match the textarea.
+        let leftLines = splitLines(left)
+        let rightLines = splitLines(right)
         return diffLines(leftLines, rightLines, ignoreWhitespace: ignoreWhitespace)
     }
 

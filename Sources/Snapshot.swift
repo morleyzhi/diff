@@ -35,6 +35,8 @@ enum Snapshot {
         root.addSubview(minimap)
         root.addSubview(right)
 
+        left.syncFromModel()
+        right.syncFromModel()
         left.layoutSubtreeIfNeeded()
         right.layoutSubtreeIfNeeded()
         minimap.layoutSubtreeIfNeeded()

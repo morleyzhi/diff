@@ -3,14 +3,24 @@ import AppKit
 final class DiffPaneView: NSView {
     let side: Side
     unowned let model: AppModel
-    private var selectionAnchor: TextPosition?
-    private var selectionEnd: TextPosition?
+
+    private let scrollView = NSScrollView()
+    private let textView = PaneTextView()
+    private var isApplyingText = false
+    private var isSyncingScroll = false
+    private var isFocused = false
+    private var placeholderLabel = NSTextField(labelWithString: "")
 
     init(side: Side, model: AppModel) {
         self.side = side
         self.model = model
         super.init(frame: .zero)
-        registerForDraggedTypes([.fileURL, .string])
+        wantsLayer = true
+        layer?.masksToBounds = true
+        layer?.cornerRadius = 6
+        setup()
+        syncFromModel()
+        updateChrome()
     }
 
     @available(*, unavailable)
@@ -18,160 +28,233 @@ final class DiffPaneView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    override var isFlipped: Bool { true }
-    override var acceptsFirstResponder: Bool { true }
     override var isOpaque: Bool { true }
-    override var canBecomeKeyView: Bool { true }
 
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
-        needsDisplay = true
+    override func layout() {
+        super.layout()
+        let inset: CGFloat = 3
+        scrollView.frame = bounds.insetBy(dx: inset, dy: inset)
+        placeholderLabel.frame = scrollView.frame.insetBy(dx: 18, dy: 18)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let view = super.hitTest(point)
+        if view === placeholderLabel {
+            return textView
+        }
+        return view
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window != nil, model.focusedSide == side {
-            window?.makeFirstResponder(self)
+            focusEditor()
         }
     }
 
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .iBeam)
+    func focusEditor() {
+        window?.makeFirstResponder(textView)
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.textBackgroundColor.setFill()
-        bounds.fill()
+    func syncFromModel() {
+        let text = side == .left ? model.leftText : model.rightText
+        setTextIfNeeded(text)
+        applyHighlights()
+        updatePlaceholder()
+        updateChrome()
+    }
 
-        let rows = model.rows
-        let font = model.font()
-        let lineHeight = model.lineHeight
-        let charWidth = max(font.maximumAdvancement.width, 7)
-        let first = max(0, Int(model.scrollOffset.rounded(.down)))
-        let last = min(rows.count, first + Int(bounds.height / lineHeight) + 2)
-        let gutter = gutterWidth(charWidth: charWidth, rows: rows)
-        let horizontal = side == .left ? model.leftHorizontal : model.rightHorizontal
-        let currentHunk = model.hunks.indices.contains(model.currentHunkIndex) ? model.hunks[model.currentHunkIndex] : nil
-        let textAttributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.labelColor,
-        ]
-        let numberAttributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: DiffTheme.lineNumber,
-        ]
+    func setTextIfNeeded(_ text: String) {
+        if textView.string == text { return }
+        isApplyingText = true
+        let selected = textView.selectedRange()
+        textView.string = text
+        let clamped = NSRange(location: min(selected.location, (text as NSString).length), length: 0)
+        textView.setSelectedRange(clamped)
+        isApplyingText = false
+        updatePlaceholder()
+    }
 
-        DiffTheme.gutter.setFill()
-        CGRect(x: 0, y: 0, width: gutter, height: bounds.height).fill()
+    func applyHighlights() {
+        guard let layoutManager = textView.layoutManager else { return }
+        let storage = textView.textStorage
+        let full = NSRange(location: 0, length: storage?.length ?? 0)
+        layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: full)
+        layoutManager.removeTemporaryAttribute(.underlineStyle, forCharacterRange: full)
 
-        if rows.isEmpty {
-            drawPlaceholder(gutter: gutter)
-            return
-        }
+        guard model.isActive else { return }
 
-        for index in first..<last {
-            let row = rows[index]
-            let y = (CGFloat(index) - model.scrollOffset) * lineHeight
-            let rowRect = CGRect(x: 0, y: y, width: bounds.width, height: lineHeight)
-            if let currentHunk, currentHunk.rows.contains(index) {
-                DiffTheme.currentHunk.setFill()
-                rowRect.fill()
+        let text = textView.string
+        let lineStarts = Self.lineStartOffsets(in: text)
+        let lineColor = side == .left ? DiffTheme.deleteLine : DiffTheme.insertLine
+        let charColor = side == .left ? DiffTheme.deleteChar : DiffTheme.insertChar
+
+        for row in model.rows {
+            let lineNumber = side == .left ? row.leftNumber : row.rightNumber
+            let lineText = side == .left ? row.left : row.right
+            let changes = side == .left ? row.leftChanges : row.rightChanges
+            let shouldHighlight: Bool = {
+                switch (side, row.kind) {
+                case (.left, .delete), (.left, .replace), (.right, .insert), (.right, .replace):
+                    return true
+                default:
+                    return false
+                }
+            }()
+
+            guard shouldHighlight, let lineNumber, lineText != nil else { continue }
+            let index = lineNumber - 1
+            guard lineStarts.indices.contains(index) else { continue }
+            let start = lineStarts[index]
+            let lineRange = (text as NSString).lineRange(for: NSRange(location: start, length: 0))
+            layoutManager.addTemporaryAttribute(.backgroundColor, value: lineColor, forCharacterRange: lineRange)
+
+            for change in changes {
+                if let range = Self.utf16Range(ofCharacters: change, inLineAt: start, line: lineText ?? "", fullText: text) {
+                    layoutManager.addTemporaryAttribute(.backgroundColor, value: charColor, forCharacterRange: range)
+                }
             }
-            drawRowBackground(row, in: rowRect, gutter: gutter)
-            drawLineNumber(row, y: y, gutter: gutter, attributes: numberAttributes)
-            drawRowText(row, y: y, gutter: gutter, charWidth: charWidth, horizontal: horizontal, attributes: textAttributes)
-        }
-
-        if let selection = normalizedSelection() {
-            drawSelection(selection, first: first, last: last, gutter: gutter, charWidth: charWidth, lineHeight: lineHeight, horizontal: horizontal)
         }
     }
 
-    override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
-        model.focusedSide = side
-        let position = position(at: convert(event.locationInWindow, from: nil))
-        if event.clickCount >= 3 {
-            selectionAnchor = TextPosition(row: position.row, column: 0)
-            selectionEnd = TextPosition(row: position.row, column: lineLength(position.row))
-        } else if event.clickCount == 2 {
-            selectionAnchor = wordBoundary(from: position, forward: false)
-            selectionEnd = wordBoundary(from: position, forward: true)
+    func scrollToLine(_ line: Int) {
+        let text = textView.string as NSString
+        guard line > 0 else { return }
+        let starts = Self.lineStartOffsets(in: text as String)
+        let index = min(line - 1, max(0, starts.count - 1))
+        guard starts.indices.contains(index) else { return }
+        let range = NSRange(location: starts[index], length: 0)
+        isSyncingScroll = true
+        textView.scrollRangeToVisible(range)
+        isSyncingScroll = false
+    }
+
+    func scrollToProgress(_ progress: CGFloat) {
+        guard let doc = scrollView.documentView else { return }
+        let clip = scrollView.contentView.bounds
+        let maxY = max(0, doc.bounds.height - clip.height)
+        var origin = clip.origin
+        origin.y = min(max(0, progress), 1) * maxY
+        isSyncingScroll = true
+        scrollView.contentView.scroll(to: origin)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        isSyncingScroll = false
+    }
+
+    func currentScrollProgress() -> CGFloat {
+        guard let doc = scrollView.documentView else { return 0 }
+        let clip = scrollView.contentView.bounds
+        let maxY = max(0, doc.bounds.height - clip.height)
+        if maxY <= 0 { return 0 }
+        return min(max(0, clip.minY / maxY), 1)
+    }
+
+    func selectedText() -> String {
+        let range = textView.selectedRange()
+        if range.length == 0 { return textView.string }
+        return (textView.string as NSString).substring(with: range)
+    }
+
+    func visibleTextWidth() -> CGFloat {
+        max(0, textView.bounds.width - 24)
+    }
+
+    func setFocused(_ focused: Bool) {
+        isFocused = focused
+        if focused {
+            model.focusedSide = side
+        }
+        updateChrome()
+    }
+
+    private func setup() {
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = .textBackgroundColor
+
+        textView.pane = self
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.allowsUndo = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.usesFindBar = true
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.font = model.font()
+        textView.textColor = .labelColor
+        textView.backgroundColor = .textBackgroundColor
+        textView.insertionPointColor = .labelColor
+        textView.delegate = textView
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = true
+        textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.lineFragmentPadding = 8
+        textView.textContainerInset = NSSize(width: 8, height: 10)
+
+        scrollView.documentView = textView
+        addSubview(scrollView)
+
+        placeholderLabel.stringValue = side == .left ? "Paste original text (⌘V)" : "Paste changed text (⌘V)"
+        placeholderLabel.textColor = DiffTheme.placeholder
+        placeholderLabel.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+        placeholderLabel.alignment = .left
+        placeholderLabel.lineBreakMode = .byWordWrapping
+        placeholderLabel.maximumNumberOfLines = 3
+        addSubview(placeholderLabel)
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(scrollViewDidScroll(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        scrollView.contentView.postsBoundsChangedNotifications = true
+
+        registerForDraggedTypes([.fileURL, .string])
+    }
+
+    private func updateChrome() {
+        layer?.borderWidth = isFocused ? 2 : 1
+        layer?.borderColor = (isFocused ? NSColor.controlAccentColor : NSColor.separatorColor).cgColor
+        let background: NSColor
+        if isFocused {
+            background = NSColor.textBackgroundColor.blended(withFraction: 0.08, of: .controlAccentColor)
+                ?? NSColor.textBackgroundColor
         } else {
-            selectionAnchor = position
-            selectionEnd = position
+            background = .textBackgroundColor
         }
-        needsDisplay = true
+        textView.backgroundColor = background
+        scrollView.backgroundColor = background
+        layer?.backgroundColor = background.cgColor
     }
 
-    override func mouseDragged(with event: NSEvent) {
-        selectionEnd = position(at: convert(event.locationInWindow, from: nil))
-        if let end = selectionEnd {
-            reveal(end.row)
-        }
-        needsDisplay = true
+    private func updatePlaceholder() {
+        placeholderLabel.isHidden = !textView.string.isEmpty
     }
 
-    override func scrollWheel(with event: NSEvent) {
-        if abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) {
-            let current = side == .left ? model.leftHorizontal : model.rightHorizontal
-            model.setHorizontal(current - event.scrollingDeltaX, side: side)
-            return
-        }
-        model.scroll(by: event.scrollingDeltaY)
+    @objc private func scrollViewDidScroll(_ notification: Notification) {
+        if isSyncingScroll { return }
+        model.paneDidScroll(side: side, progress: currentScrollProgress())
     }
 
-    override func keyDown(with event: NSEvent) {
-        switch event.keyCode {
-        case 125:
-            model.scroll(by: -model.lineHeight * (event.modifierFlags.contains(.command) ? 0 : 1))
-            if event.modifierFlags.contains(.command) { model.nextHunk() }
-        case 126:
-            model.scroll(by: model.lineHeight * (event.modifierFlags.contains(.command) ? 0 : 1))
-            if event.modifierFlags.contains(.command) { model.prevHunk() }
-        case 121:
-            model.scroll(by: -bounds.height)
-        case 116:
-            model.scroll(by: bounds.height)
-        case 119:
-            model.setScroll(model.maxScrollOffset)
-        case 115:
-            model.setScroll(0)
-        default:
-            interpretKeyEvents([event])
-        }
+    func handleTextChange() {
+        if isApplyingText { return }
+        updatePlaceholder()
+        model.setText(textView.string, side: side)
     }
 
-    override func selectAll(_ sender: Any?) {
-        if model.rows.isEmpty { return }
-        selectionAnchor = TextPosition(row: 0, column: 0)
-        let last = model.rows.count - 1
-        selectionEnd = TextPosition(row: last, column: lineLength(last))
-        needsDisplay = true
-    }
-
-    @objc func paste(_ sender: Any?) {
-        model.paste(into: side)
-    }
-
-    @objc func copy(_ sender: Any?) {
-        model.copySelection(from: side)
-    }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "v" {
-            paste(nil)
-            return true
-        }
-        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "c" {
-            copy(nil)
-            return true
-        }
-        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "a" {
-            selectAll(nil)
-            return true
-        }
-        return super.performKeyEquivalent(with: event)
+    func handleFontChange() {
+        textView.font = model.font()
+        applyHighlights()
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
@@ -179,216 +262,89 @@ final class DiffPaneView: NSView {
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         let pasteboard = sender.draggingPasteboard
-        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], let url = urls.first {
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           let url = urls.first {
             model.loadFile(url, into: side)
+            focusEditor()
             return true
         }
         if let text = pasteboard.string(forType: .string) {
             model.setText(text, side: side)
+            focusEditor()
             return true
         }
         return false
     }
 
-    override func menu(for event: NSEvent) -> NSMenu? {
-        let menu = NSMenu()
-        menu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "v")
-        menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "c")
-        menu.addItem(withTitle: "Clear", action: #selector(clearSide), keyEquivalent: "")
-        menu.addItem(withTitle: "Open File…", action: #selector(openSide), keyEquivalent: "o")
-        return menu
-    }
-
-    @objc private func clearSide() {
-        model.clear(side: side)
-    }
-
-    @objc private func openSide() {
-        model.openFile(into: side)
-    }
-
-    func selectedText() -> String {
-        guard let selection = normalizedSelection() else {
-            return side == .left ? model.leftText : model.rightText
+    private static func lineStartOffsets(in text: String) -> [Int] {
+        if text.isEmpty { return [0] }
+        let ns = text as NSString
+        var starts: [Int] = []
+        var location = 0
+        while location <= ns.length {
+            starts.append(location)
+            if location == ns.length { break }
+            let lineRange = ns.lineRange(for: NSRange(location: location, length: 0))
+            let next = NSMaxRange(lineRange)
+            if next <= location { break }
+            location = next
         }
-        var lines: [String] = []
-        for row in selection.start.row...selection.end.row {
-            let text = lineText(row)
-            let start = row == selection.start.row ? min(selection.start.column, text.count) : 0
-            let end = row == selection.end.row ? min(selection.end.column, text.count) : text.count
-            if start <= end {
-                let startIndex = text.index(text.startIndex, offsetBy: start)
-                let endIndex = text.index(text.startIndex, offsetBy: end)
-                lines.append(String(text[startIndex..<endIndex]))
-            }
+        if text.hasSuffix("\n") {
+            // keep trailing empty line start already added when location == length
         }
-        return lines.joined(separator: "\n")
+        return starts
     }
 
-    func visibleTextWidth() -> CGFloat {
-        max(0, bounds.width - gutterWidth(charWidth: model.monospacedAdvance(), rows: model.rows) - 8)
-    }
-
-    private func drawPlaceholder(gutter: CGFloat) {
-        let text = side == .left ? "Paste original text (⌘V)" : "Paste changed text (⌘V)"
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 14, weight: .medium),
-            .foregroundColor: DiffTheme.placeholder,
-        ]
-        let size = (text as NSString).size(withAttributes: attributes)
-        let point = CGPoint(
-            x: gutter + max(16, (bounds.width - gutter - size.width) / 2),
-            y: max(16, (bounds.height - size.height) / 2)
-        )
-        (text as NSString).draw(at: point, withAttributes: attributes)
-    }
-
-    private func drawRowBackground(_ row: DiffRow, in rect: CGRect, gutter: CGFloat) {
-        let textRect = CGRect(x: gutter, y: rect.minY, width: rect.width - gutter, height: rect.height)
-        switch (side, row.kind) {
-        case (.left, .delete), (.left, .replace):
-            DiffTheme.deleteLine.setFill()
-            textRect.fill()
-        case (.right, .insert), (.right, .replace):
-            DiffTheme.insertLine.setFill()
-            textRect.fill()
-        default:
-            break
-        }
-
-        let marker = CGRect(x: gutter - 3, y: rect.minY, width: 3, height: rect.height)
-        switch (side, row.kind) {
-        case (.left, .delete), (.left, .replace):
-            DiffTheme.minimapDelete.setFill()
-            marker.fill()
-        case (.right, .insert), (.right, .replace):
-            DiffTheme.minimapInsert.setFill()
-            marker.fill()
-        default:
-            break
-        }
-    }
-
-    private func drawLineNumber(_ row: DiffRow, y: CGFloat, gutter: CGFloat, attributes: [NSAttributedString.Key: Any]) {
-        let number = side == .left ? row.leftNumber : row.rightNumber
-        guard let number else { return }
-        let text = "\(number)" as NSString
-        let size = text.size(withAttributes: attributes)
-        let point = CGPoint(x: gutter - size.width - 10, y: y + 1)
-        text.draw(at: point, withAttributes: attributes)
-    }
-
-    private func drawRowText(
-        _ row: DiffRow,
-        y: CGFloat,
-        gutter: CGFloat,
-        charWidth: CGFloat,
-        horizontal: CGFloat,
-        attributes: [NSAttributedString.Key: Any]
-    ) {
-        guard let text = side == .left ? row.left : row.right else { return }
-        let changes = side == .left ? row.leftChanges : row.rightChanges
-        let charColor = side == .left ? DiffTheme.deleteChar : DiffTheme.insertChar
-        let textX = gutter + 8 - horizontal * charWidth
-
-        charColor.setFill()
-        for range in changes {
-            let rect = CGRect(
-                x: textX + CGFloat(range.lowerBound) * charWidth,
-                y: y,
-                width: CGFloat(max(1, range.count)) * charWidth,
-                height: model.lineHeight
-            )
-            rect.fill()
-        }
-
-        (text as NSString).draw(
-            with: CGRect(x: textX, y: y, width: 100_000, height: model.lineHeight),
-            options: [.usesLineFragmentOrigin],
-            attributes: attributes
-        )
-    }
-
-    private func drawSelection(
-        _ selection: (start: TextPosition, end: TextPosition),
-        first: Int,
-        last: Int,
-        gutter: CGFloat,
-        charWidth: CGFloat,
-        lineHeight: CGFloat,
-        horizontal: CGFloat
-    ) {
-        NSColor.selectedTextBackgroundColor.withAlphaComponent(0.35).setFill()
-        let startRow = max(first, selection.start.row)
-        let endRow = min(last - 1, selection.end.row)
-        if startRow > endRow { return }
-        for row in startRow...endRow {
-            let startCol = row == selection.start.row ? selection.start.column : 0
-            let endCol = row == selection.end.row ? selection.end.column : max(lineLength(row), 1)
-            let x = gutter + 8 + (CGFloat(startCol) - horizontal) * charWidth
-            let width = CGFloat(max(1, endCol - startCol)) * charWidth
-            let y = (CGFloat(row) - model.scrollOffset) * lineHeight
-            CGRect(x: x, y: y, width: width, height: lineHeight).fill()
-        }
-    }
-
-    private func gutterWidth(charWidth: CGFloat, rows: [DiffRow]) -> CGFloat {
-        let digits = max(3, String(max(rows.count, 1)).count)
-        return CGFloat(digits) * charWidth + 20
-    }
-
-    private func position(at point: CGPoint) -> TextPosition {
-        let charWidth = max(model.monospacedAdvance(), 7)
-        let gutter = gutterWidth(charWidth: charWidth, rows: model.rows)
-        let row = min(max(0, Int(((point.y / model.lineHeight) + model.scrollOffset).rounded(.down))), max(0, model.rows.count - 1))
-        let column = max(0, Int(((point.x - gutter - 8) / charWidth + (side == .left ? model.leftHorizontal : model.rightHorizontal)).rounded(.down)))
-        return TextPosition(row: row, column: min(column, lineLength(row)))
-    }
-
-    private func lineText(_ row: Int) -> String {
-        guard model.rows.indices.contains(row) else { return "" }
-        return (side == .left ? model.rows[row].left : model.rows[row].right) ?? ""
-    }
-
-    private func lineLength(_ row: Int) -> Int {
-        lineText(row).count
-    }
-
-    private func reveal(_ row: Int) {
-        let first = model.scrollOffset
-        let last = first + model.visibleLineCount() - 1
-        if CGFloat(row) < first {
-            model.setScroll(CGFloat(row))
-        } else if CGFloat(row) > last {
-            model.setScroll(CGFloat(row) - model.visibleLineCount() + 1)
-        }
-    }
-
-    private func wordBoundary(from position: TextPosition, forward: Bool) -> TextPosition {
-        let text = Array(lineText(position.row))
-        if text.isEmpty { return position }
-        var column = min(max(position.column, 0), text.count)
-        if forward {
-            while column < text.count, text[column].isWhitespace { column += 1 }
-            while column < text.count, !text[column].isWhitespace { column += 1 }
-        } else {
-            while column > 0, text[column - 1].isWhitespace { column -= 1 }
-            while column > 0, !text[column - 1].isWhitespace { column -= 1 }
-        }
-        return TextPosition(row: position.row, column: column)
-    }
-
-    private func normalizedSelection() -> (start: TextPosition, end: TextPosition)? {
-        guard let start = selectionAnchor, let end = selectionEnd else { return nil }
-        if start.row > end.row || (start.row == end.row && start.column > end.column) {
-            return (end, start)
-        }
-        if start.row == end.row && start.column == end.column { return nil }
-        return (start, end)
+    private static func utf16Range(
+        ofCharacters range: Range<Int>,
+        inLineAt lineStart: Int,
+        line: String,
+        fullText: String
+    ) -> NSRange? {
+        guard range.lowerBound >= 0, range.upperBound <= line.count else { return nil }
+        let startIdx = line.index(line.startIndex, offsetBy: range.lowerBound)
+        let endIdx = line.index(line.startIndex, offsetBy: range.upperBound)
+        let relative = NSRange(startIdx..<endIdx, in: line)
+        return NSRange(location: lineStart + relative.location, length: relative.length)
     }
 }
 
-private struct TextPosition {
-    var row: Int
-    var column: Int
+final class PaneTextView: NSTextView, NSTextViewDelegate {
+    weak var pane: DiffPaneView?
+
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became {
+            pane?.setFocused(true)
+        }
+        return became
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned {
+            pane?.setFocused(false)
+        }
+        return resigned
+    }
+
+    func textDidChange(_ notification: Notification) {
+        pane?.handleTextChange()
+    }
+
+    override func paste(_ sender: Any?) {
+        let wasEmpty = string.isEmpty
+        let side = pane?.side
+        super.paste(sender)
+        pane?.handleTextChange()
+        if wasEmpty, side == .left, AppModel.shared.rightText.isEmpty {
+            AppModel.shared.focusedSide = .right
+            AppModel.shared.rightPane?.focusEditor()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        pane?.setFocused(true)
+        super.mouseDown(with: event)
+    }
 }
