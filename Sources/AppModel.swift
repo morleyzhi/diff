@@ -96,6 +96,12 @@ final class AppModel {
         pane?.replaceWithPasteboard()
     }
 
+    func pasteIntoFocusedSide() {
+        let side = focusedSide
+        let pane = side == .left ? leftPane : rightPane
+        pane?.replaceWithPasteboard()
+    }
+
     func clear(side: Side) {
         setText("", side: side)
         (side == .left ? leftPane : rightPane)?.focusEditor()

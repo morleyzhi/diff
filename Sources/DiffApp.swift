@@ -39,6 +39,12 @@ struct DiffCommands: Commands {
             }
             .keyboardShortcut("o", modifiers: [.command, .shift])
         }
+        CommandGroup(before: .pasteboard) {
+            Button("Paste into Focused Side") {
+                AppModel.shared.pasteIntoFocusedSide()
+            }
+            .keyboardShortcut("v", modifiers: [.command])
+        }
         CommandGroup(after: .pasteboard) {
             Button("Paste into Left") {
                 AppModel.shared.paste(into: .left)

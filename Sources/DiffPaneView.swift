@@ -216,6 +216,9 @@ final class DiffPaneView: NSView {
         isFocused = focused
         if focused {
             model.focusedSide = side
+            if window?.firstResponder !== textView {
+                window?.makeFirstResponder(textView)
+            }
         }
         if changed {
             updateChrome()
@@ -461,7 +464,7 @@ final class PaneTextView: NSTextView, NSTextViewDelegate {
     }
 
     override func mouseDown(with event: NSEvent) {
-        pane?.setFocused(true)
+        pane?.focusEditor()
         super.mouseDown(with: event)
     }
 
