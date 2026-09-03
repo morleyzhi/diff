@@ -452,12 +452,7 @@ final class PaneTextView: NSTextView, NSTextViewDelegate {
     }
 
     override func paste(_ sender: Any?) {
-        // Replace-all when empty or everything is selected; otherwise insert like a textarea.
-        let allSelected = selectedRange().length == (string as NSString).length && !string.isEmpty
-        if string.isEmpty || allSelected {
-            pane?.replaceWithPasteboard()
-            return
-        }
+        // Native paste into this text view only — do not re-route via app-level side state.
         super.paste(sender)
         pane?.handleTextChange()
         pane?.didPasteInEditor()
@@ -466,14 +461,5 @@ final class PaneTextView: NSTextView, NSTextViewDelegate {
     override func mouseDown(with event: NSEvent) {
         pane?.focusEditor()
         super.mouseDown(with: event)
-    }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.modifierFlags.contains(.command),
-           event.charactersIgnoringModifiers?.lowercased() == "v" {
-            paste(nil)
-            return true
-        }
-        return super.performKeyEquivalent(with: event)
     }
 }
