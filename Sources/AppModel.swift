@@ -91,15 +91,9 @@ final class AppModel {
     }
 
     func paste(into side: Side) {
-        guard let text = NSPasteboard.general.string(forType: .string) else { return }
         focusedSide = side
         let pane = side == .left ? leftPane : rightPane
-        pane?.focusEditor()
-        setText(text, side: side)
-        if side == .left, rightText.isEmpty {
-            focusedSide = .right
-            rightPane?.focusEditor()
-        }
+        pane?.replaceWithPasteboard()
     }
 
     func clear(side: Side) {

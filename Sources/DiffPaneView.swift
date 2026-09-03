@@ -4,12 +4,17 @@ final class DiffPaneView: NSView {
     let side: Side
     unowned let model: AppModel
 
+    private let header = NSView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let pasteButton = NSButton(title: "Paste", target: nil, action: nil)
     private let scrollView = NSScrollView()
     private let textView = PaneTextView()
+    private let placeholderLabel = NSTextField(labelWithString: "")
+
     private var isApplyingText = false
     private var isSyncingScroll = false
     private var isFocused = false
-    private var placeholderLabel = NSTextField(labelWithString: "")
+    private var flashWorkItem: DispatchWorkItem?
 
     init(side: Side, model: AppModel) {
         self.side = side
@@ -17,7 +22,7 @@ final class DiffPaneView: NSView {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.masksToBounds = true
-        layer?.cornerRadius = 6
+        layer?.cornerRadius = 8
         setup()
         syncFromModel()
         updateChrome()
@@ -32,9 +37,25 @@ final class DiffPaneView: NSView {
 
     override func layout() {
         super.layout()
-        let inset: CGFloat = 3
-        scrollView.frame = bounds.insetBy(dx: inset, dy: inset)
-        placeholderLabel.frame = scrollView.frame.insetBy(dx: 18, dy: 18)
+        let inset: CGFloat = 4
+        let headerHeight: CGFloat = 34
+        header.frame = NSRect(
+            x: inset,
+            y: bounds.height - inset - headerHeight,
+            width: bounds.width - inset * 2,
+            height: headerHeight
+        )
+        titleLabel.frame = NSRect(x: 10, y: 6, width: max(80, header.bounds.width - 100), height: 22)
+        pasteButton.frame = NSRect(x: header.bounds.width - 78, y: 4, width: 68, height: 26)
+
+        let body = NSRect(
+            x: inset,
+            y: inset,
+            width: bounds.width - inset * 2,
+            height: max(0, bounds.height - inset * 2 - headerHeight - 2)
+        )
+        scrollView.frame = body
+        placeholderLabel.frame = body.insetBy(dx: 16, dy: 14)
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -45,23 +66,39 @@ final class DiffPaneView: NSView {
         return view
     }
 
+    override func mouseDown(with event: NSEvent) {
+        focusEditor()
+        super.mouseDown(with: event)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window != nil, model.focusedSide == side {
-            focusEditor()
+            DispatchQueue.main.async { [weak self] in
+                self?.focusEditor()
+            }
         }
     }
 
     func focusEditor() {
         window?.makeFirstResponder(textView)
+        setFocused(true)
     }
 
     func syncFromModel() {
+        applyModelUpdates(forceText: true)
+    }
+
+    func applyModelUpdates(forceText: Bool = false) {
         let text = side == .left ? model.leftText : model.rightText
-        setTextIfNeeded(text)
+        let editingHere = window?.firstResponder === textView
+        if forceText || !editingHere {
+            setTextIfNeeded(text)
+        }
         applyHighlights()
         updatePlaceholder()
         updateChrome()
+        textView.font = model.font()
     }
 
     func setTextIfNeeded(_ text: String) {
@@ -69,18 +106,33 @@ final class DiffPaneView: NSView {
         isApplyingText = true
         let selected = textView.selectedRange()
         textView.string = text
-        let clamped = NSRange(location: min(selected.location, (text as NSString).length), length: 0)
-        textView.setSelectedRange(clamped)
+        let length = (text as NSString).length
+        let location = min(selected.location, length)
+        textView.setSelectedRange(NSRange(location: location, length: 0))
         isApplyingText = false
         updatePlaceholder()
     }
 
+    func replaceWithPasteboard() {
+        guard let text = NSPasteboard.general.string(forType: .string) else { return }
+        focusEditor()
+        let previous = textView.string
+        model.setText(text, side: side)
+        setTextIfNeeded(side == .left ? model.leftText : model.rightText)
+        textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        textView.setSelectedRange(NSRange(location: 0, length: (textView.string as NSString).length))
+        flashPasteFeedback(replaced: previous != textView.string)
+        if side == .left, model.rightText.isEmpty {
+            model.focusedSide = .right
+            model.rightPane?.focusEditor()
+        }
+    }
+
     func applyHighlights() {
         guard let layoutManager = textView.layoutManager else { return }
-        let storage = textView.textStorage
-        let full = NSRange(location: 0, length: storage?.length ?? 0)
+        let storageLength = textView.textStorage?.length ?? 0
+        let full = NSRange(location: 0, length: storageLength)
         layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: full)
-        layoutManager.removeTemporaryAttribute(.underlineStyle, forCharacterRange: full)
 
         guard model.isActive else { return }
 
@@ -110,7 +162,7 @@ final class DiffPaneView: NSView {
             layoutManager.addTemporaryAttribute(.backgroundColor, value: lineColor, forCharacterRange: lineRange)
 
             for change in changes {
-                if let range = Self.utf16Range(ofCharacters: change, inLineAt: start, line: lineText ?? "", fullText: text) {
+                if let range = Self.utf16Range(ofCharacters: change, inLineAt: start, line: lineText ?? "") {
                     layoutManager.addTemporaryAttribute(.backgroundColor, value: charColor, forCharacterRange: range)
                 }
             }
@@ -160,14 +212,55 @@ final class DiffPaneView: NSView {
     }
 
     func setFocused(_ focused: Bool) {
+        let changed = isFocused != focused
         isFocused = focused
         if focused {
             model.focusedSide = side
         }
-        updateChrome()
+        if changed {
+            updateChrome()
+        }
+    }
+
+    func handleTextChange() {
+        if isApplyingText { return }
+        updatePlaceholder()
+        model.setText(textView.string, side: side)
+    }
+
+    func handleFontChange() {
+        textView.font = model.font()
+        applyHighlights()
+    }
+
+    func didPasteInEditor() {
+        let selected = textView.selectedRange()
+        textView.scrollRangeToVisible(selected)
+        flashPasteFeedback(replaced: false)
+        if side == .left, model.rightText.isEmpty, !textView.string.isEmpty {
+            model.focusedSide = .right
+            model.rightPane?.focusEditor()
+        }
     }
 
     private func setup() {
+        header.wantsLayer = true
+        header.layer?.cornerRadius = 6
+        addSubview(header)
+
+        titleLabel.stringValue = side == .left ? "Original" : "Changed"
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = .secondaryLabelColor
+        header.addSubview(titleLabel)
+
+        pasteButton.bezelStyle = .rounded
+        pasteButton.controlSize = .small
+        pasteButton.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        pasteButton.target = self
+        pasteButton.action = #selector(pasteButtonClicked)
+        pasteButton.toolTip = side == .left ? "Replace left side with clipboard (⌘⇧1)" : "Replace right side with clipboard (⌘⇧2)"
+        header.addSubview(pasteButton)
+
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true
@@ -191,7 +284,7 @@ final class DiffPaneView: NSView {
         textView.backgroundColor = .textBackgroundColor
         textView.insertionPointColor = .labelColor
         textView.delegate = textView
-        textView.minSize = NSSize(width: 0, height: 0)
+        textView.minSize = .zero
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = true
@@ -203,12 +296,14 @@ final class DiffPaneView: NSView {
         scrollView.documentView = textView
         addSubview(scrollView)
 
-        placeholderLabel.stringValue = side == .left ? "Paste original text (⌘V)" : "Paste changed text (⌘V)"
+        placeholderLabel.stringValue = side == .left
+            ? "Click here, then paste (⌘V)\nor use the Paste button"
+            : "Click here, then paste (⌘V)\nor use the Paste button"
         placeholderLabel.textColor = DiffTheme.placeholder
         placeholderLabel.font = NSFont.systemFont(ofSize: 14, weight: .medium)
         placeholderLabel.alignment = .left
         placeholderLabel.lineBreakMode = .byWordWrapping
-        placeholderLabel.maximumNumberOfLines = 3
+        placeholderLabel.maximumNumberOfLines = 4
         addSubview(placeholderLabel)
 
         NotificationCenter.default.addObserver(
@@ -218,43 +313,66 @@ final class DiffPaneView: NSView {
             object: scrollView.contentView
         )
         scrollView.contentView.postsBoundsChangedNotifications = true
-
         registerForDraggedTypes([.fileURL, .string])
     }
 
+    @objc private func pasteButtonClicked() {
+        replaceWithPasteboard()
+    }
+
     private func updateChrome() {
-        layer?.borderWidth = isFocused ? 2 : 1
-        layer?.borderColor = (isFocused ? NSColor.controlAccentColor : NSColor.separatorColor).cgColor
-        let background: NSColor
+        let accent = NSColor.controlAccentColor
+        layer?.borderWidth = isFocused ? 3 : 1
+        layer?.borderColor = (isFocused ? accent : NSColor.separatorColor).cgColor
+
+        let bodyBackground: NSColor
+        let headerBackground: NSColor
         if isFocused {
-            background = NSColor.textBackgroundColor.blended(withFraction: 0.08, of: .controlAccentColor)
+            bodyBackground = NSColor.textBackgroundColor.blended(withFraction: 0.16, of: accent)
                 ?? NSColor.textBackgroundColor
+            headerBackground = accent.withAlphaComponent(0.18)
+            titleLabel.textColor = .labelColor
         } else {
-            background = .textBackgroundColor
+            bodyBackground = .textBackgroundColor
+            headerBackground = NSColor.controlBackgroundColor.withAlphaComponent(0.65)
+            titleLabel.textColor = .secondaryLabelColor
         }
-        textView.backgroundColor = background
-        scrollView.backgroundColor = background
-        layer?.backgroundColor = background.cgColor
+
+        textView.backgroundColor = bodyBackground
+        scrollView.backgroundColor = bodyBackground
+        layer?.backgroundColor = bodyBackground.cgColor
+        header.layer?.backgroundColor = headerBackground.cgColor
+        pasteButton.contentTintColor = isFocused ? accent : .secondaryLabelColor
     }
 
     private func updatePlaceholder() {
         placeholderLabel.isHidden = !textView.string.isEmpty
     }
 
+    private func flashPasteFeedback(replaced: Bool) {
+        flashWorkItem?.cancel()
+        wantsLayer = true
+        let flash = CABasicAnimation(keyPath: "backgroundColor")
+        flash.fromValue = NSColor.controlAccentColor.withAlphaComponent(0.35).cgColor
+        flash.toValue = textView.backgroundColor.cgColor
+        flash.duration = 0.45
+        layer?.add(flash, forKey: "pasteFlash")
+
+        titleLabel.stringValue = replaced
+            ? (side == .left ? "Original · pasted" : "Changed · pasted")
+            : (side == .left ? "Original · updated" : "Changed · updated")
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.titleLabel.stringValue = self.side == .left ? "Original" : "Changed"
+        }
+        flashWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: work)
+    }
+
     @objc private func scrollViewDidScroll(_ notification: Notification) {
         if isSyncingScroll { return }
         model.paneDidScroll(side: side, progress: currentScrollProgress())
-    }
-
-    func handleTextChange() {
-        if isApplyingText { return }
-        updatePlaceholder()
-        model.setText(textView.string, side: side)
-    }
-
-    func handleFontChange() {
-        textView.font = model.font()
-        applyHighlights()
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
@@ -266,11 +384,13 @@ final class DiffPaneView: NSView {
            let url = urls.first {
             model.loadFile(url, into: side)
             focusEditor()
+            flashPasteFeedback(replaced: true)
             return true
         }
         if let text = pasteboard.string(forType: .string) {
             model.setText(text, side: side)
             focusEditor()
+            flashPasteFeedback(replaced: true)
             return true
         }
         return false
@@ -289,17 +409,13 @@ final class DiffPaneView: NSView {
             if next <= location { break }
             location = next
         }
-        if text.hasSuffix("\n") {
-            // keep trailing empty line start already added when location == length
-        }
         return starts
     }
 
     private static func utf16Range(
         ofCharacters range: Range<Int>,
         inLineAt lineStart: Int,
-        line: String,
-        fullText: String
+        line: String
     ) -> NSRange? {
         guard range.lowerBound >= 0, range.upperBound <= line.count else { return nil }
         let startIdx = line.index(line.startIndex, offsetBy: range.lowerBound)
@@ -333,18 +449,28 @@ final class PaneTextView: NSTextView, NSTextViewDelegate {
     }
 
     override func paste(_ sender: Any?) {
-        let wasEmpty = string.isEmpty
-        let side = pane?.side
+        // Replace-all when empty or everything is selected; otherwise insert like a textarea.
+        let allSelected = selectedRange().length == (string as NSString).length && !string.isEmpty
+        if string.isEmpty || allSelected {
+            pane?.replaceWithPasteboard()
+            return
+        }
         super.paste(sender)
         pane?.handleTextChange()
-        if wasEmpty, side == .left, AppModel.shared.rightText.isEmpty {
-            AppModel.shared.focusedSide = .right
-            AppModel.shared.rightPane?.focusEditor()
-        }
+        pane?.didPasteInEditor()
     }
 
     override func mouseDown(with event: NSEvent) {
         pane?.setFocused(true)
         super.mouseDown(with: event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "v" {
+            paste(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
     }
 }

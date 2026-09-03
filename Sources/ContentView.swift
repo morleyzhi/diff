@@ -15,7 +15,7 @@ struct DiffPaneRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: DiffPaneView, context: Context) {
-        nsView.syncFromModel()
+        nsView.applyModelUpdates()
     }
 }
 
