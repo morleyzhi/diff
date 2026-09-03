@@ -60,17 +60,10 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItem(placement: .navigation) {
-            Text(model.hunkLabel)
-                .font(.system(.body, design: .rounded))
-                .foregroundStyle(.secondary)
-                .frame(minWidth: 160, alignment: .leading)
-        }
-        ToolbarItem(placement: .automatic) {
-            Toggle(isOn: $model.ignoreWhitespace) {
-                Label("Ignore Whitespace", systemImage: "space")
-            }
-            .toggleStyle(.checkbox)
-            .help("Treat whitespace-only changes as equal")
+            Toggle("Ignore Whitespace", isOn: $model.ignoreWhitespace)
+                .toggleStyle(.switch)
+                .help("Treat whitespace-only changes as equal")
+                .padding(.leading, 12)
         }
         ToolbarItemGroup(placement: .automatic) {
             Button(action: model.prevHunk) {
