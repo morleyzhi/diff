@@ -59,12 +59,6 @@ struct ContentView: View {
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
-            Toggle("Ignore Whitespace", isOn: $model.ignoreWhitespace)
-                .toggleStyle(.switch)
-                .help("Treat whitespace-only changes as equal")
-                .padding(.leading, 12)
-        }
         ToolbarItemGroup(placement: .automatic) {
             Button(action: model.prevHunk) {
                 Label("Previous change", systemImage: "chevron.up")
@@ -83,6 +77,16 @@ struct ContentView: View {
                 model.clear(side: .right)
             }
             .help("Clear both sides")
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Toggle(isOn: $model.ignoreWhitespace) {
+                Text("Ignore whitespace")
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .help("Treat whitespace-only changes as equal")
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
         }
     }
 
