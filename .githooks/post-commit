@@ -1,0 +1,13 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$ROOT" ]]; then
+  exit 0
+fi
+
+echo "post-commit: compiling and installing Diff…"
+if ! "$ROOT/scripts/install.sh"; then
+  echo "post-commit: install failed" >&2
+  exit 1
+fi
